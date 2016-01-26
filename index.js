@@ -3,9 +3,14 @@ var ss = require("sdk/simple-storage");
 var clipboard = require("sdk/clipboard");
 var windowUtils = require("sdk/window/utils");
 
+const {Cc, Ci, Cu} = require("chrome");
+Cu.import("resource://gre/modules/Services.jsm");
+Cu.import("resource://gre/modules/TelemetrySession.jsm");
+let gOS = Cc["@mozilla.org/observer-service;1"].getService(Ci.nsIObserverService);
+
 // load and validate settings
 var gMode = ss.storage.mode;
-if (gMode !== "threadHangs" && gMode !== "eventLoopLags" && gMode !== "inputEventResponseLags") {
+if (["threadHangs", "eventLoopLags", "inputEventResponseLags"].indexOf(gMode) < 0) {
   gMode = "threadHangs";
 }
 var gPlaySound = ss.storage.playSound;
@@ -17,9 +22,10 @@ if (typeof gHangThreshold !== "number" || gHangThreshold < 1) {
   gHangThreshold = 126;
 }
 
-const { setInterval } = require("sdk/timers");
+const { setTimeout } = require("sdk/timers");
 const { ActionButton } = require("sdk/ui/button/action");
 
+// define all the SVG icons
 const ANIMATE_TEMPLATE = '<!-- ANIMATE -->';
 const ANIMATE_ROTATE_SVG = '' +
   '<animateTransform attributeName="transform" ' +
@@ -107,13 +113,6 @@ panel.port.on("copy", function(value) {
   clipboard.set(value);
 });
 
-const {Cc, Ci, Cu} = require("chrome");
-
-Cu.import("resource://gre/modules/Services.jsm");
-
-let gOS = Cc["@mozilla.org/observer-service;1"]
-            .getService(Ci.nsIObserverService);
-
 // the toolbar icon should be red while the user is active, and blue when not
 gOS.addObserver({
   observe: function (subject, topic, data) {
@@ -142,82 +141,209 @@ var webProgressListener = {
 var gBrowser = windowUtils.getMostRecentBrowserWindow().getBrowser();
 gBrowser.addTabsProgressListener(webProgressListener);
 
+// function that retrieves the current child hangs and caches it for a short duration
+// caching this is useful since each call has to go through the events queue
+let cachedPreviousChildHangs = null;
+let lastChildHangsRetrievedTime = -Infinity;
+function getChildThreadHangs() {
+  if (Date.now() - lastChildHangsRetrievedTime < 300) {
+    return new Promise((resolve) => { resolve(cachedPreviousChildHangs); });
+  }
+  lastChildHangsRetrievedTime = Date.now();
+  return TelemetrySession.getChildThreadHangs().then((hangs) => {
+    cachedPreviousChildHangs = hangs;
+    return hangs;
+  });
+}
+
 // returns the number of Gecko hangs, and the computed minimum threshold for those hangs (which is a value >= gHangThreshold)
-function numGeckoHangs() {
-  var hangs;
+function getHangs() {
   switch(gMode) {
     case "threadHangs":
-      hangs = numGeckoThreadHangs();
-      panel.port.emit("warning", hangs === null ? "unavailableBHR" : null);
-      return hangs
+      return numGeckoThreadHangs();
     case "eventLoopLags":
-      hangs = numEventLoopLags();
-      panel.port.emit("warning", hangs === null ? "unavailableEventLoopLags" : null);
-      return hangs;
+      return numEventLoopLags();
     case "inputEventResponseLags":
-      hangs = numInputEventResponseLags();
-      panel.port.emit("warning", hangs === null ? "unavailableInputEventResponseLags" : null);
-      return hangs;
+      return numInputEventResponseLags();
     default:
       console.warn("Unknown mode: ", gMode);
-      return {numHangs: null, minBucketLowerBound: 0};
+      return new Promise((resolve) => {
+        resolve({numHangs: null, minBucketLowerBound: 0});
+      });
   }
 }
 
-function numGeckoThreadHangs() {
-  let geckoThread = Services.telemetry.threadHangStats.find(thread =>
-    thread.name == "Gecko"
-  );
-  if (!geckoThread || !geckoThread.activity.counts) {
-    console.warn("Lolwhut? No Gecko thread? No hangs?");
-    return {numHangs: null, minBucketLowerBound: 0};
+function numGeckoThreadHangs(includeChildHangs = true) {
+  if (includeChildHangs && !TelemetrySession.getChildThreadHangs) {
+    panel.port.emit("warning", "unavailableChildBHR");
+    return new Promise((resolve) => { resolve({numHangs: null, minBucketLowerBound: 0}); });
   }
-  // see the NOTE in mostRecentHangs() for caveats when using the activity.counts histogram
-  // to summarize, the ranges are the inclusive upper bound of the histogram rather than the inclusive lower bound
-  let numHangs = 0;
-  let minBucketLowerBound = Infinity;
-  geckoThread.activity.counts.forEach((count, i) => {
-    var lowerBound = geckoThread.activity.ranges[i - 1] + 1;
-    if (lowerBound >= gHangThreshold) {
-      numHangs += count;
-      minBucketLowerBound = Math.min(minBucketLowerBound, lowerBound);
+
+  let geckoThread = Services.telemetry.threadHangStats.find(thread => thread.name == "Gecko");
+  if (!geckoThread || !geckoThread.activity.counts) {
+    panel.port.emit("warning", "unavailableBHR");
+    return new Promise((resolve) => { resolve({numHangs: null, minBucketLowerBound: 0}); });
+  }
+
+  return new Promise((resolve) => {
+    if (includeChildHangs) {
+      getChildThreadHangs().then((hangs) => {
+        // accumulate all of the counts in the child processes with the counts in the parent process
+        let counts = geckoThread.activity.counts.slice(0);
+        hangs.forEach((threadHangStats) => {
+          let childGeckoThread = threadHangStats.find(thread => thread.name == "Gecko_Child");
+          if (childGeckoThread && childGeckoThread.activity.counts) {
+            childGeckoThread.activity.counts.forEach((count, i) => { counts[i] += count; });
+          }
+        });
+        resolve(counts);
+      });
+    } else { // Just use the parent process stats
+      resolve(geckoThread.activity.counts);
     }
+  }).then((counts) => {
+    // see the NOTE in mostRecentHangs() for caveats when using the activity.counts histogram
+    // to summarize, the ranges are the inclusive upper bound of the histogram rather than the inclusive lower bound
+    let numHangs = 0;
+    let minBucketLowerBound = Infinity;
+    counts.forEach((count, i) => {
+      var lowerBound = geckoThread.activity.ranges[i - 1] + 1;
+      if (lowerBound >= gHangThreshold) {
+        numHangs += count;
+        minBucketLowerBound = Math.min(minBucketLowerBound, lowerBound);
+      }
+    });
+    panel.port.emit("warning", null);
+    return {numHangs: numHangs, minBucketLowerBound: minBucketLowerBound};
   });
-  return {numHangs: numHangs, minBucketLowerBound: minBucketLowerBound};
 }
 
 function numEventLoopLags() {
-  try {
-    var snapshot = Services.telemetry.getHistogramById("EVENTLOOP_UI_ACTIVITY_EXP_MS").snapshot();
-  } catch (e) { // histogram doesn't exist, the Firefox version is likely older than 45.0a1
-    return {numHangs: null, minBucketLowerBound: 0};
-  }
-  let numHangs = 0;
-  let minBucketLowerBound = Infinity;
-  for (let i = 0; i < snapshot.ranges.length; ++i) {
-    if (snapshot.ranges[i] >= gHangThreshold) {
-      numHangs += snapshot.counts[i];
-      minBucketLowerBound = Math.min(minBucketLowerBound, snapshot.ranges[i]);
+  return new Promise((resolve) => {
+    try {
+      var snapshot = Services.telemetry.getHistogramById("EVENTLOOP_UI_ACTIVITY_EXP_MS").snapshot();
+    } catch (e) { // histogram doesn't exist, the Firefox version is likely older than 45.0a1
+      panel.port.emit("warning", "unavailableEventLoopLags");
+      resolve({numHangs: null, minBucketLowerBound: 0});
     }
-  }
-  return {numHangs: numHangs, minBucketLowerBound: minBucketLowerBound};
+    let numHangs = 0;
+    let minBucketLowerBound = Infinity;
+    for (let i = 0; i < snapshot.ranges.length; ++i) {
+      if (snapshot.ranges[i] >= gHangThreshold) {
+        numHangs += snapshot.counts[i];
+        minBucketLowerBound = Math.min(minBucketLowerBound, snapshot.ranges[i]);
+      }
+    }
+    panel.port.emit("warning", null);
+    resolve({numHangs: numHangs, minBucketLowerBound: minBucketLowerBound});
+  });
 }
 
 function numInputEventResponseLags() {
-  try {
-    var snapshot = Services.telemetry.getHistogramById("INPUT_EVENT_RESPONSE_MS").snapshot();
-  } catch (e) { // histogram doesn't exist, the Firefox version is likely older than 46.0a1
-    return {numHangs: null, minBucketLowerBound: 0};
-  }
-  let numHangs = 0;
-  let minBucketLowerBound = Infinity;
-  for (let i = 0; i < snapshot.ranges.length; ++i) {
-    if (snapshot.ranges[i] > gHangThreshold) {
-      result += snapshot.counts[i];
-      minBucketLowerBound = Math.min(minBucketLowerBound, snapshot.ranges[i]);
+  return new Promise((resolve) => {
+    try {
+      var snapshot = Services.telemetry.getHistogramById("INPUT_EVENT_RESPONSE_MS").snapshot();
+    } catch (e) { // histogram doesn't exist, the Firefox version is likely older than 46.0a1
+      panel.port.emit("warning", "unavailableInputEventResponseLags");
+      resolve({numHangs: null, minBucketLowerBound: 0});
     }
+    let numHangs = 0;
+    let minBucketLowerBound = Infinity;
+    for (let i = 0; i < snapshot.ranges.length; ++i) {
+      if (snapshot.ranges[i] > gHangThreshold) {
+        result += snapshot.counts[i];
+        minBucketLowerBound = Math.min(minBucketLowerBound, snapshot.ranges[i]);
+      }
+    }
+    panel.port.emit("warning", null);
+    resolve({numHangs: numHangs, minBucketLowerBound: minBucketLowerBound});
+  });
+}
+
+// Returns an array of the most recent BHR hangs
+var previousCountsMap = {}; // this is a mapping from stack traces (as strings) to corresponding histogram counts
+var cachedRecentHangs = [];
+let lastMostRecentHangsTime = getUptime();
+function mostRecentHangs(includeChildHangs = true) {
+  if (includeChildHangs && !TelemetrySession.getChildThreadHangs) {
+    return new Promise((resolve) => { resolve({numHangs: null, minBucketLowerBound: 0}); });
   }
-  return {numHangs: numHangs, minBucketLowerBound: minBucketLowerBound};
+
+  let geckoThread = Services.telemetry.threadHangStats.find(thread => thread.name == "Gecko");
+  if (!geckoThread || !geckoThread.activity.counts) {
+    return new Promise((resolve) => { resolve({numHangs: null, minBucketLowerBound: 0}); });
+  }
+
+  return new Promise((resolve) => {
+    if (includeChildHangs) {
+      getChildThreadHangs().then((hangs) => {
+        // accumulate all of the counts in the child processes with the counts in the parent process
+        let childHangEntries = [];
+        hangs.forEach((threadHangStats) => {
+          let childGeckoThread = threadHangStats.find(thread => thread.name == "Gecko_Child");
+          if (childGeckoThread && childGeckoThread.activity.counts) {
+            childHangEntries = childHangEntries.concat(childGeckoThread.hangs);
+          }
+        });
+        resolve([geckoThread.hangs, childHangEntries]);
+      });
+    } else { // Just use the parent process stats
+      resolve([geckoThread.hangs, []]);
+    }
+  }).then(hangInfo => {
+    [hangEntries, childHangEntries] = hangInfo;
+    console.error(childHangEntries)
+    let timestamp = (new Date()).getTime(); // note that this timestamp will only be as accurate as the interval at which this function is called
+    let uptime = getUptime(); // this value matches the X axis in the timeline for the Gecko Profiler addon
+
+    // diff the current hangs with the previous hangs to figure out what changed in this call, if anything
+    // hangs list will only ever grow: https://dxr.mozilla.org/mozilla-central/source/xpcom/threads/BackgroundHangMonitor.cpp#440
+    // therefore, we only need to check current stacks against previous stacks - there is no need for a 2 way diff
+    // hangs are identified by their stack traces: https://dxr.mozilla.org/mozilla-central/source/toolkit/components/telemetry/Telemetry.cpp#4316
+    function diffHangEntry(hangEntry, isChild) {
+      var stack = hangEntry.stack.slice(0).reverse().join("\n");
+      var ranges = hangEntry.histogram.ranges.concat([Infinity]);
+      var counts = hangEntry.histogram.counts;
+      var previousCounts = previousCountsMap.hasOwnProperty(stack) ? previousCountsMap[stack] : [];
+
+      // diff this hang histogram with the previous hang histogram
+      counts.forEach((count, i) => {
+        var previousCount = previousCounts[i] || 0;
+        /*
+        NOTE: when you access the thread hangs, the ranges are actually the inclusive upper bounds of the buckets rather than the inclusive lower bound like other histograms.
+        Basically, when we access the buckets of a TimeHistogram in JS, it has a 0 prepended to the ranges; in C++, the indices behave as all other histograms do.
+
+        For example, bucket 7 actually represents hangs of duration 64ms to 127ms, inclusive. For most other exponential histograms, this would be 128ms to 255ms.
+
+        References:
+        * mozilla::Telemetry::CreateJSTimeHistogram - http://mxr.mozilla.org/mozilla-central/source/toolkit/components/telemetry/Telemetry.cpp#2947
+        * mozilla::Telemetry::TimeHistogram - http://mxr.mozilla.org/mozilla-central/source/toolkit/components/telemetry/ThreadHangStats.h#25
+        */
+        while (count > previousCount) { // each additional count here is a new hang with this stack and a duration in this bucket's range
+          let lowerBound = ranges[i - 1] + 1;
+          if (lowerBound >= gHangThreshold) {
+            cachedRecentHangs.push({
+              stack: stack, lowerBound: lowerBound, upperBound: ranges[i],
+              timestamp: timestamp, uptime: uptime, previousUptime: lastMostRecentHangsTime,
+              isChild: isChild,
+            });
+            if (cachedRecentHangs.length > 10) { // only keep the last 10 items
+              cachedRecentHangs.shift();
+            }
+          }
+          count --;
+        }
+      });
+
+      // the hang entry is not mutated when new instances of this hang come in
+      // since we aren't using this entry in the previous hangs anymore, we can just set it in the previous hangs
+      previousCountsMap[stack] = counts;
+    }
+    hangEntries.forEach(entry => { diffHangEntry(entry, false); });
+    childHangEntries.forEach(entry => { diffHangEntry(entry, true); });
+    lastMostRecentHangsTime = uptime;
+    return cachedRecentHangs;
+  });
 }
 
 var soundPlayerPage = require("sdk/page-worker").Page({
@@ -238,68 +364,12 @@ function getUptime() {
   }
 }
 
-// Returns an array of the most recent BHR hangs
-var previousCountsMap = {}; // this is a mapping from stack traces (as strings) to corresponding histogram counts
-var recentHangs = [];
-let lastMostRecentHangsTime = getUptime();
-function mostRecentHangs() {
-  let geckoThread = Services.telemetry.threadHangStats.find(thread =>
-    thread.name == "Gecko"
-  );
-  if (!geckoThread) {
-    console.warn("Uh oh, there doesn't seem to be a thread with name \"Gecko\"!");
-    return [];
-  }
-
-  var timestamp = (new Date()).getTime(); // note that this timestamp will only be as accurate as the interval at which this function is called
-  var uptime = getUptime(); // this value matches the X axis in the timeline for the Gecko Profiler addon
-
-  // diff the current hangs with the previous hangs to figure out what changed in this call, if anything
-  // hangs list will only ever grow: https://dxr.mozilla.org/mozilla-central/source/xpcom/threads/BackgroundHangMonitor.cpp#440
-  // therefore, we only need to check current stacks against previous stacks - there is no need for a 2 way diff
-  // hangs are identified by their stack traces: https://dxr.mozilla.org/mozilla-central/source/toolkit/components/telemetry/Telemetry.cpp#4316
-  geckoThread.hangs.forEach(hangEntry => {
-    var stack = hangEntry.stack.slice(0).reverse().join("\n");
-    var ranges = hangEntry.histogram.ranges.concat([Infinity]);
-    var counts = hangEntry.histogram.counts;
-    var previousCounts = previousCountsMap.hasOwnProperty(stack) ? previousCountsMap[stack] : [];
-
-    // diff this hang histogram with the previous hang histogram
-    counts.forEach((count, i) => {
-      var previousCount = previousCounts[i] || 0;
-      /*
-      NOTE: when you access the thread hangs, the ranges are actually the inclusive upper bounds of the buckets rather than the inclusive lower bound like other histograms.
-      Basically, when we access the buckets of a TimeHistogram in JS, it has a 0 prepended to the ranges; in C++, the indices behave as all other histograms do.
-
-      For example, bucket 7 actually represents hangs of duration 64ms to 127ms, inclusive. For most other exponential histograms, this would be 128ms to 255ms.
-
-      References:
-      * mozilla::Telemetry::CreateJSTimeHistogram - http://mxr.mozilla.org/mozilla-central/source/toolkit/components/telemetry/Telemetry.cpp#2947
-      * mozilla::Telemetry::TimeHistogram - http://mxr.mozilla.org/mozilla-central/source/toolkit/components/telemetry/ThreadHangStats.h#25
-      */
-      while (count > previousCount) { // each additional count here is a new hang with this stack and a duration in this bucket's range
-        let lowerBound = ranges[i - 1] + 1;
-        if (lowerBound >= gHangThreshold) {
-          recentHangs.push({stack: stack, lowerBound: lowerBound, upperBound: ranges[i], timestamp: timestamp, uptime: uptime, previousUptime: lastMostRecentHangsTime});
-          if (recentHangs.length > 10) { // only keep the last 10 items
-            recentHangs.shift();
-          }
-        }
-        count --;
-      }
-    });
-
-    // the hang entry is not mutated when new instances of this hang come in
-    // since we aren't using this entry in the previous hangs anymore, we can just set it in the previous hangs
-    previousCountsMap[stack] = counts;
-  });
-  lastMostRecentHangsTime = uptime;
-  return recentHangs;
-}
-
-const BADGE_COLOURS = ["red", "blue", "brown", "black"];
+let numHangs = null;
+let computedThreshold = 0;
 let numHangsObserved = 0;
 let prevNumHangs = null;
+let baseNumHangs = 0; // the number of hangs at the time the counter was last reset
+const BADGE_COLOURS = ["red", "blue", "brown", "black"];
 function updateBadge() {
   if (numHangs === null) {
     button.badge = "?"
@@ -317,42 +387,47 @@ function updateBadge() {
   }
 }
 
-// reset the current hang stacks so we only show the new ones coming in
-mostRecentHangs();
-recentHangs = [];
-
-const CHECK_FOR_HANG_INTERVAL = 400; // in millis
-let { numHangs: numHangs, minBucketLowerBound: computedThreshold } = numGeckoHangs(); // note: this will be null if the hang counter is not available
-let baseNumHangs = 0; // the number of hangs at the time the counter was last reset
-setInterval(() => {
-  let { numHangs: hangCount, minBucketLowerBound: lower } = numGeckoHangs();
-  if (hangCount !== numHangs) {
-    numHangs = hangCount;
-    updateBadge();
-    let hangs = mostRecentHangs();
-    panel.port.emit("set-hangs", hangs);
-    if (hangs.length > 0) {
-      button.label = "Most recent hang stack:\n\n" + hangs[hangs.length - 1].stack;
-    } else {
-      button.label = "No recent hang stacks.";
-    }
-    //exports.observe(undefined, "thread-hang");
-  }
-  if (lower !== computedThreshold) { // update the computed threshold
-    computedThreshold = lower;
-    panel.port.emit("set-computed-threshold", computedThreshold);
-  }
-}, CHECK_FOR_HANG_INTERVAL);
-clearCount();
-
 function clearCount() {
   baseNumHangs = numHangs;
   numHangsObserved = 0;
+  computedThreshold = 0;
+  cachedRecentHangs = []; // empty out the list of hangs
   updateBadge();
   panel.port.emit("set-computed-threshold", computedThreshold);
   panel.port.emit("set-hangs", []); // clear the panel's list of hangs
-  recentHangs = []; // empty out the list of hangs
 }
+
+const CHECK_FOR_HANG_INTERVAL = 400; // in millis
+function update() {
+  getHangs().then((result) => {
+    let { numHangs: hangCount, minBucketLowerBound: lower } = result; // note: numHangs will be null if the hang counter is not available
+    if (lower !== computedThreshold) { // update the computed threshold
+      computedThreshold = lower;
+      panel.port.emit("set-computed-threshold", computedThreshold);
+    }
+    if (hangCount !== numHangs) { // new hangs detected
+      numHangs = hangCount;
+      updateBadge();
+      mostRecentHangs().then((recentHangs) => {
+        panel.port.emit("set-hangs", recentHangs);
+        if (recentHangs.length > 0) {
+          button.label = "Most recent hang stack:\n\n" + recentHangs[recentHangs.length - 1].stack;
+        } else {
+          button.label = "No recent hang stacks.";
+        }
+        setTimeout(update, CHECK_FOR_HANG_INTERVAL);
+      });
+    } else {
+      setTimeout(update, CHECK_FOR_HANG_INTERVAL);
+    }
+  });
+}
+getHangs().then((result) => {
+  let { numHangs: hangCount, minBucketLowerBound: lower } = result; // note: numHangs will be null if the hang counter is not available
+  [numHangs, computedThreshold] = [hangCount, lower];
+  clearCount();
+  setTimeout(update, CHECK_FOR_HANG_INTERVAL); // we set the timeouts each time to not back up the queue of child thread hang stats requests when the browser is really slow
+});
 
 /* Enable this rAF loop to verify that the hangs reported are roughly equal
  * to the number of hangs observed from script. In Nightly 45, they were.

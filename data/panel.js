@@ -53,16 +53,20 @@ self.port.on("warning", function(warningType) {
     case null:
       banner.style.display = "none";
       break;
+    case "unavailableChildBHR":
+      banner.innerHTML = "CHILD PROCESS BACKGROUND HANG REPORTING <a href=\"about:telemetry\" target=\"_blank\">UNAVAILABLE</a>; CHECK FIREFOX VERSION, ENABLE BHR, AND RESTART FIREFOX";
+      banner.style.display = "block";
+      break;
     case "unavailableBHR":
-      banner.innerHTML = "BACKGROUND HANG REPORTING <a href=\"about:telemetry\" target=\"_blank\">UNAVAILABLE</a>; ENABLE BHR AND RESTART FIREFOX";
+      banner.innerHTML = "BACKGROUND HANG REPORTING <a href=\"about:telemetry\" target=\"_blank\">UNAVAILABLE</a>; CHECK FIREFOX VERSION, ENABLE BHR, AND RESTART FIREFOX";
       banner.style.display = "block";
       break;
     case "unavailableEventLoopLags":
-      banner.innerHTML = "EVENTLOOP_UI_ACTIVITY_EXP_MS HISTOGRAM <a href=\"about:telemetry\" target=\"_blank\">UNAVAILABLE</a>; CHECK FIREFOX VERSION";
+      banner.innerHTML = "EVENTLOOP_UI_ACTIVITY_EXP_MS HISTOGRAM <a href=\"about:telemetry\" target=\"_blank\">UNAVAILABLE</a>; CHECK FIREFOX VERSION AND ENABLE TELEMETRY";
       banner.style.display = "block";
       break;
     case "unavailableInputEventResponseLags":
-      banner.innerHTML = "INPUT_EVENT_RESPONSE_MS HISTOGRAM <a href=\"about:telemetry\" target=\"_blank\">UNAVAILABLE</a>; CHECK FIREFOX VERSION";
+      banner.innerHTML = "INPUT_EVENT_RESPONSE_MS HISTOGRAM <a href=\"about:telemetry\" target=\"_blank\">UNAVAILABLE</a>; CHECK FIREFOX VERSION AND ENABLE TELEMETRY";
       banner.style.display = "block";
       break;
     default:
@@ -78,6 +82,9 @@ function setHangs(hangs) {
   hangs.reverse().forEach(hang => {
     // create an entry for the hang
     var entry = document.createElement("div");
+    if (hang.isChild) {
+      entry.className = "childHang";
+    }
       var contents = document.createElement("pre");
       contents.className = "stack";
       contents.appendChild(document.createTextNode(hang.stack));
