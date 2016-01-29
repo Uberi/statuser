@@ -159,7 +159,7 @@ let cachedPreviousChildHangs = null;
 let lastChildHangsRetrievedTime = -Infinity;
 function getChildThreadHangs() {
   if (Date.now() - lastChildHangsRetrievedTime < 300) {
-    return new Promise((resolve) => { resolve(cachedPreviousChildHangs); });
+    return Promise.resolve(cachedPreviousChildHangs);
   }
   lastChildHangsRetrievedTime = Date.now();
   return TelemetrySession.getChildThreadHangs().then((hangs) => {
@@ -181,22 +181,20 @@ function getHangs() {
       return numInputEventResponseLags();
     default:
       console.warn("Unknown mode: ", gMode);
-      return new Promise((resolve) => {
-        resolve({numHangs: null, minBucketLowerBound: 0});
-      });
+      return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
   }
 }
 
 function numGeckoThreadHangs(includeChildHangs = true) {
   if (includeChildHangs && !TelemetrySession.getChildThreadHangs) {
     panel.port.emit("warning", "unavailableChildBHR");
-    return new Promise((resolve) => { resolve({numHangs: null, minBucketLowerBound: 0}); });
+    return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
   }
 
   let geckoThread = Services.telemetry.threadHangStats.find(thread => thread.name == "Gecko");
   if (!geckoThread || !geckoThread.activity.counts) {
     panel.port.emit("warning", "unavailableBHR");
-    return new Promise((resolve) => { resolve({numHangs: null, minBucketLowerBound: 0}); });
+    return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
   }
 
   return new Promise((resolve) => {
@@ -232,60 +230,56 @@ function numGeckoThreadHangs(includeChildHangs = true) {
 }
 
 function numEventLoopLags() {
-  return new Promise((resolve) => {
-    try {
-      var snapshot = Services.telemetry.getHistogramById("EVENTLOOP_UI_ACTIVITY_EXP_MS").snapshot();
-    } catch (e) { // histogram doesn't exist, the Firefox version is likely older than 45.0a1
-      panel.port.emit("warning", "unavailableEventLoopLags");
-      resolve({numHangs: null, minBucketLowerBound: 0});
+  try {
+    var snapshot = Services.telemetry.getHistogramById("EVENTLOOP_UI_ACTIVITY_EXP_MS").snapshot();
+  } catch (e) { // histogram doesn't exist, the Firefox version is likely older than 45.0a1
+    panel.port.emit("warning", "unavailableEventLoopLags");
+    return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
+  }
+  let numHangs = 0;
+  let minBucketLowerBound = Infinity;
+  for (let i = 0; i < snapshot.ranges.length; ++i) {
+    if (snapshot.ranges[i] >= gHangThreshold) {
+      numHangs += snapshot.counts[i];
+      minBucketLowerBound = Math.min(minBucketLowerBound, snapshot.ranges[i]);
     }
-    let numHangs = 0;
-    let minBucketLowerBound = Infinity;
-    for (let i = 0; i < snapshot.ranges.length; ++i) {
-      if (snapshot.ranges[i] >= gHangThreshold) {
-        numHangs += snapshot.counts[i];
-        minBucketLowerBound = Math.min(minBucketLowerBound, snapshot.ranges[i]);
-      }
-    }
-    panel.port.emit("warning", null);
-    resolve({numHangs: numHangs, minBucketLowerBound: minBucketLowerBound});
-  });
+  }
+  panel.port.emit("warning", null);
+  return Promise.resolve({numHangs: numHangs, minBucketLowerBound: minBucketLowerBound});
 }
 
 function numInputEventResponseLags() {
-  return new Promise((resolve) => {
-    try {
-      var snapshot = Services.telemetry.getHistogramById("INPUT_EVENT_RESPONSE_MS").snapshot();
-    } catch (e) { // histogram doesn't exist, the Firefox version is likely older than 46.0a1
-      panel.port.emit("warning", "unavailableInputEventResponseLags");
-      resolve({numHangs: null, minBucketLowerBound: 0});
+  try {
+    var snapshot = Services.telemetry.getHistogramById("INPUT_EVENT_RESPONSE_MS").snapshot();
+  } catch (e) { // histogram doesn't exist, the Firefox version is likely older than 46.0a1
+    panel.port.emit("warning", "unavailableInputEventResponseLags");
+    return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
+  }
+  let numHangs = 0;
+  let minBucketLowerBound = Infinity;
+  for (let i = 0; i < snapshot.ranges.length; ++i) {
+    if (snapshot.ranges[i] > gHangThreshold) {
+      result += snapshot.counts[i];
+      minBucketLowerBound = Math.min(minBucketLowerBound, snapshot.ranges[i]);
     }
-    let numHangs = 0;
-    let minBucketLowerBound = Infinity;
-    for (let i = 0; i < snapshot.ranges.length; ++i) {
-      if (snapshot.ranges[i] > gHangThreshold) {
-        result += snapshot.counts[i];
-        minBucketLowerBound = Math.min(minBucketLowerBound, snapshot.ranges[i]);
-      }
-    }
-    resolve({numHangs: numHangs, minBucketLowerBound: minBucketLowerBound});
-  });
+  }
+  return Promise.resolve({numHangs: numHangs, minBucketLowerBound: minBucketLowerBound});
 }
 
 // Returns an array of the most recent BHR hangs, or null on error
-var previousCountsMap = {}; // this is a mapping from stack traces (as strings) to corresponding histogram counts
-var cachedRecentHangs = [];
+let previousCountsMap = {}; // this is a mapping from stack traces (as strings) to corresponding histogram counts
+let cachedRecentHangs = [];
 let lastMostRecentHangsTime = getUptime();
 function mostRecentHangs(includeChildHangs = true) {
   if (includeChildHangs && TelemetrySession.getChildThreadHangs === undefined) {
     panel.port.emit("warning", "unavailableChildBHR");
-    return new Promise((resolve) => { resolve(null); });
+    return Promise.resolve(null);
   }
 
   let geckoThread = Services.telemetry.threadHangStats.find(thread => thread.name == "Gecko");
   if (!geckoThread || !geckoThread.activity.counts) {
     panel.port.emit("warning", "unavailableBHR");
-    return new Promise((resolve) => { resolve(null); });
+    return Promise.resolve(null);
   }
 
   return new Promise((resolve) => {
@@ -401,7 +395,7 @@ function updateBadge() {
 }
 
 function clearCount() {
-  baseNumHangs = numHangs;
+  baseNumHangs = prevNumHangs = numHangs;
   numHangsObserved = 0;
   computedThreshold = 0;
   cachedRecentHangs = []; // empty out the list of hangs
@@ -412,8 +406,7 @@ function clearCount() {
 
 const CHECK_FOR_HANG_INTERVAL = 400; // in millis
 function update() {
-  getHangs().then((result) => {
-    let { numHangs: hangCount, minBucketLowerBound: lower } = result; // note: numHangs will be null if the hang counter is not available
+  getHangs().then(({numHangs: hangCount, minBucketLowerBound: lower}) => {
     if (lower !== computedThreshold) { // update the computed threshold
       computedThreshold = lower;
       panel.port.emit("set-computed-threshold", computedThreshold);
@@ -444,11 +437,14 @@ function update() {
     }
   });
 }
-getHangs().then((result) => {
-  let { numHangs: hangCount, minBucketLowerBound: lower } = result; // note: numHangs will be null if the hang counter is not available
+getHangs().then(({numHangs: hangCount, minBucketLowerBound: lower}) => {
   [numHangs, computedThreshold] = [hangCount, lower];
-  clearCount();
-  setTimeout(update, CHECK_FOR_HANG_INTERVAL); // we set the timeouts each time to not back up the queue of child thread hang stats requests when the browser is really slow
+
+  // Call the function once to initialize previousCountsMap properly
+  mostRecentHangs(gIncludeChildHangs).then(() => {
+    clearCount();
+    setTimeout(update, CHECK_FOR_HANG_INTERVAL); // we set the timeouts each time to not back up the queue of child thread hang stats requests when the browser is really slow
+  });
 });
 
 /* Enable this rAF loop to verify that the hangs reported are roughly equal
