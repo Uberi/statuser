@@ -10,8 +10,8 @@ let gOS = Cc["@mozilla.org/observer-service;1"].getService(Ci.nsIObserverService
 
 // load and validate settings
 var gMode = ss.storage.mode;
-if (["threadHangs", "eventLoopLags", "inputEventResponseLags"].indexOf(gMode) < 0) {
-  gMode = "threadHangs";
+if (["threadHangsParentOnly", "threadHangs", "eventLoopLags", "inputEventResponseLags"].indexOf(gMode) < 0) {
+  gMode = "threadHangsParentOnly";
 }
 var gPlaySound = ss.storage.playSound;
 if (typeof gPlaySound !== "boolean") {
@@ -20,6 +20,10 @@ if (typeof gPlaySound !== "boolean") {
 var gHangThreshold = ss.storage.hangThreshold; // ms over which a bucket must start to be counted as a hang
 if (typeof gHangThreshold !== "number" || gHangThreshold < 1) {
   gHangThreshold = 126;
+}
+var gIncludeChildHangs = ss.storage.includeChildHangs;
+if (typeof gIncludeChildHangs !== "boolean") {
+  gIncludeChildHangs = false;
 }
 
 const { setTimeout } = require("sdk/timers");
@@ -78,9 +82,10 @@ var panel = require("sdk/panel").Panel({
 function showPanel() {
   panel.show({position: button});
   panel.port.emit("show", { // emit event on the panel's port so the script inside knows it's shown
+    mode: gMode,
     playSound: gPlaySound,
     hangThreshold: gHangThreshold,
-    mode: gMode,
+    includeChildHangs: gIncludeChildHangs,
   });
 }
 
@@ -106,6 +111,12 @@ panel.port.on("hang-threshold-changed", function(hangThreshold) {
 // clear the hang counter
 panel.port.on("clear-count", function() {
   clearCount();
+});
+
+// toggle whether child hangs are included
+panel.port.on("include-child-hangs-changed", function(includeChildHangs) {
+  gIncludeChildHangs = includeChildHangs;
+  ss.storage.includeChildHangs = includeChildHangs;
 });
 
 // copy a value to the clipboard
@@ -142,7 +153,8 @@ var gBrowser = windowUtils.getMostRecentBrowserWindow().getBrowser();
 gBrowser.addTabsProgressListener(webProgressListener);
 
 // function that retrieves the current child hangs and caches it for a short duration
-// caching this is useful since each call has to go through the events queue
+// caching this is useful since each call has to go through the event queue of both parent and child processes,
+// which can be relatively slow if any of the queues are backed up
 let cachedPreviousChildHangs = null;
 let lastChildHangsRetrievedTime = -Infinity;
 function getChildThreadHangs() {
@@ -159,8 +171,10 @@ function getChildThreadHangs() {
 // returns the number of Gecko hangs, and the computed minimum threshold for those hangs (which is a value >= gHangThreshold)
 function getHangs() {
   switch(gMode) {
+    case "threadHangsParentOnly":
+      return numGeckoThreadHangs(false);
     case "threadHangs":
-      return numGeckoThreadHangs();
+      return numGeckoThreadHangs(true);
     case "eventLoopLags":
       return numEventLoopLags();
     case "inputEventResponseLags":
@@ -213,7 +227,6 @@ function numGeckoThreadHangs(includeChildHangs = true) {
         minBucketLowerBound = Math.min(minBucketLowerBound, lowerBound);
       }
     });
-    panel.port.emit("warning", null);
     return {numHangs: numHangs, minBucketLowerBound: minBucketLowerBound};
   });
 }
@@ -255,23 +268,24 @@ function numInputEventResponseLags() {
         minBucketLowerBound = Math.min(minBucketLowerBound, snapshot.ranges[i]);
       }
     }
-    panel.port.emit("warning", null);
     resolve({numHangs: numHangs, minBucketLowerBound: minBucketLowerBound});
   });
 }
 
-// Returns an array of the most recent BHR hangs
+// Returns an array of the most recent BHR hangs, or null on error
 var previousCountsMap = {}; // this is a mapping from stack traces (as strings) to corresponding histogram counts
 var cachedRecentHangs = [];
 let lastMostRecentHangsTime = getUptime();
 function mostRecentHangs(includeChildHangs = true) {
-  if (includeChildHangs && !TelemetrySession.getChildThreadHangs) {
-    return new Promise((resolve) => { resolve({numHangs: null, minBucketLowerBound: 0}); });
+  if (includeChildHangs && TelemetrySession.getChildThreadHangs === undefined) {
+    panel.port.emit("warning", "unavailableChildBHR");
+    return new Promise((resolve) => { resolve(null); });
   }
 
   let geckoThread = Services.telemetry.threadHangStats.find(thread => thread.name == "Gecko");
   if (!geckoThread || !geckoThread.activity.counts) {
-    return new Promise((resolve) => { resolve({numHangs: null, minBucketLowerBound: 0}); });
+    panel.port.emit("warning", "unavailableBHR");
+    return new Promise((resolve) => { resolve(null); });
   }
 
   return new Promise((resolve) => {
@@ -292,7 +306,6 @@ function mostRecentHangs(includeChildHangs = true) {
     }
   }).then(hangInfo => {
     [hangEntries, childHangEntries] = hangInfo;
-    console.error(childHangEntries)
     let timestamp = (new Date()).getTime(); // note that this timestamp will only be as accurate as the interval at which this function is called
     let uptime = getUptime(); // this value matches the X axis in the timeline for the Gecko Profiler addon
 
@@ -408,16 +421,25 @@ function update() {
     if (hangCount !== numHangs) { // new hangs detected
       numHangs = hangCount;
       updateBadge();
-      mostRecentHangs().then((recentHangs) => {
-        panel.port.emit("set-hangs", recentHangs);
-        if (recentHangs.length > 0) {
-          button.label = "Most recent hang stack:\n\n" + recentHangs[recentHangs.length - 1].stack;
+      mostRecentHangs(gIncludeChildHangs).then((recentHangs) => {
+        if (numHangs === null || recentHangs === null) {
+          panel.port.emit("set-hangs", []);
+          button.label = "Could not retrieve hang stacks.";
         } else {
-          button.label = "No recent hang stacks.";
+          panel.port.emit("warning", null); // hide the warning banner if it's shown, since we've successfully updated
+          panel.port.emit("set-hangs", recentHangs);
+          if (recentHangs.length > 0) {
+            button.label = "Most recent hang stack:\n\n" + recentHangs[recentHangs.length - 1].stack;
+          } else {
+            button.label = "No recent hang stacks.";
+          }
         }
         setTimeout(update, CHECK_FOR_HANG_INTERVAL);
       });
     } else {
+      if (numHangs !== null) {
+        panel.port.emit("warning", null); // hide the warning banner if it's shown, since we've successfully updated
+      }
       setTimeout(update, CHECK_FOR_HANG_INTERVAL);
     }
   });

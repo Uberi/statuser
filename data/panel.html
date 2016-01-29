@@ -10,6 +10,9 @@
       font-family: monospace;
       font-size: 12px;
     }
+    h1 {
+      margin: 0;
+    }
     a {
       color: inherit;
     }
@@ -47,7 +50,7 @@
     }
     .controls {
       display: table-cell;
-      width: 150px;
+      width: 130px;
       padding: 5px 10px;
       text-align: right;
       background: #888;
@@ -60,7 +63,7 @@
     .controls .duration {
       font-size: 12px;
     }
-    .controls .time, .controls .uptime {
+    .controls .time {
       margin-top: 5px;
     }
     .controls .copyButton {
@@ -89,10 +92,11 @@
   <h1>STATUSER SETTINGS</h1>
   <p class="description">The icon is a red square when the user is active, a blue circle when the user is inactive, and turns into a yellow square when there is a page loading in any tab.</p>
   <div>
-    <label><input type="radio" name="mode" id="countThreadHangs" /> Count thread hangs</label><br>
+    <label><input type="radio" name="mode" id="countThreadHangsParentOnly" /> Count parent process Gecko thread hangs</label><br>
+    <label><input type="radio" name="mode" id="countThreadHangs" /> Count Gecko thread hangs</label><br>
     <label><input type="radio" name="mode" id="countEventLoopLags" /> Count event loop lags</label><br>
     <label><input type="radio" name="mode" id="countInputEventResponseLags" /> Count input event response time lags</label>
-    <p class="description">Statuser can count hangs on the main thread, lags on the event loop, or spikes in input event response time. Changing this setting will reset the hang counter.</p>
+    <p class="description">Statuser can count Gecko thread hangs for the parent process, Gecko thread hangs for both parent process and content processes, lags on the event loop, or spikes in input event response time. Changing this setting will reset the hang counter.</p>
   </div>
   <hr>
   <div>
@@ -111,7 +115,10 @@
   <p class="note">On E10S builds, Statuser will <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=1228437" target="_blank">only measure main thread hangs</a>.</p>
   <hr>
   <h1>MOST RECENT HANGS</h1>
-  <p class="note">The stack traces displayed here are are Background Hang Reporter pseudo-stacks. Only the 10 most recent stack traces are shown. Stack traces are only captured for hangs of 128ms or greater.</p>
+  <div>
+    <label><input type="checkbox" id="includeChildHangs" /> Include child process hangs</label>
+    <p class="description">Statuser will show either hang stacks from the parent process only, or the parent process plus all the child processes.</p>
+  </div>
   <div id="hangStacks">
     <!-- hang stack entries are added here by `data/panel.js`, and have the following structure: -->
     <!--<div>
@@ -126,10 +133,11 @@ banana</pre>
           <img src="copy-icon.svg" />
         </button>
         <div class="time">1/19/2016, 1:09:51 PM</div>
-        <div class="uptime">912923ms uptime</div>
+        <div class="time">912523ms to 912923ms uptime</div>
       </div>
     </div>-->
   </div>
+  <p class="note">The stack traces displayed here are are Background Hang Reporter pseudo-stacks. Only the 10 most recent stack traces are shown. Stack traces are only captured for hangs of 128ms or greater.</p>
   <p class="note">Entries with a grey sidebar are parent process hangs, while entries with a blue sidebar are child process hangs. Hang uptimes correspond to the X axis in the <a href="https://developer.mozilla.org/en-US/docs/Mozilla/Performance/Profiling_with_the_Built-in_Profiler" target="_blank">Gecko Profiler addon</a> timeline.</p>
 </body>
 </html>

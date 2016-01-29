@@ -1,7 +1,11 @@
 // emit events on the panel's port for corresponding actions
+var countThreadHangsParentOnly = document.getElementById("countThreadHangsParentOnly");
 var countThreadHangs = document.getElementById("countThreadHangs");
 var countEventLoopLags = document.getElementById("countEventLoopLags");
 var countInputEventResponseLags = document.getElementById("countInputEventResponseLags");
+countThreadHangsParentOnly.addEventListener("click", function() {
+  self.port.emit("mode-changed", "threadHangsParentOnly");
+});
 countThreadHangs.addEventListener("click", function() {
   self.port.emit("mode-changed", "threadHangs");
 });
@@ -25,13 +29,21 @@ hangThreshold.addEventListener("change", function(event) {
 document.getElementById("clearCount").addEventListener("click", function() {
   self.port.emit("clear-count");
 });
+var includeChildHangs = document.getElementById("includeChildHangs");
+includeChildHangs.addEventListener("change", function(event) {
+  self.port.emit("include-child-hangs-changed", event.target.checked);
+});
 
 // listen to re-emitted show event from main script
 self.port.on("show", function(currentSettings) {
   // populate the settings dialog with the current value of the settings
   playSound.checked = currentSettings.playSound;
   hangThreshold.value = currentSettings.hangThreshold;
+  includeChildHangs.checked = currentSettings.includeChildHangs;
   switch (currentSettings.mode) {
+    case "threadHangsParentOnly":
+      document.getElementById("countThreadHangsParentOnly").checked = true;
+      break;
     case "threadHangs":
       document.getElementById("countThreadHangs").checked = true;
       break;
