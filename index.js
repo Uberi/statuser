@@ -60,6 +60,8 @@ const YELLOW_SVG = RED_SVG.replace('red', 'yellow');
 var mBaseSVG = RED_SVG;
 var mAnimateSVG = '';
 
+let numHangs = null;
+
 var button = ActionButton({
   id: "active-button",
   badge: 0,
@@ -94,11 +96,14 @@ function showPanel() {
   });
 }
 
-// switch modes between thread hang detection and event loop lag detection
+// switch modes between different detection types
 panel.port.on("mode-changed", function(mode) {
   gMode = mode;
   ss.storage.mode = mode;
-  clearCount();
+  getHangs().then(({numHangs: hangCount, minBucketLowerBound: lower}) => {
+    numHangs = hangCount;
+    clearCount();
+  });
 });
 
 // toggle notification sound on and off
@@ -273,7 +278,7 @@ function numInputEventResponseLags() {
   let minBucketLowerBound = Infinity;
   for (let i = 0; i < snapshot.ranges.length; ++i) {
     if (snapshot.ranges[i] > gHangThreshold) {
-      result += snapshot.counts[i];
+      numHangs += snapshot.counts[i];
       minBucketLowerBound = Math.min(minBucketLowerBound, snapshot.ranges[i]);
     }
   }
@@ -393,7 +398,6 @@ function getUptime() {
   }
 }
 
-let numHangs = null;
 let computedThreshold = 0;
 let numHangsObserved = 0;
 let prevNumHangs = null;
@@ -436,25 +440,19 @@ function update() {
     if (hangCount !== numHangs) { // new hangs detected
       numHangs = hangCount;
       updateBadge();
-      mostRecentHangs(gIncludeChildHangs).then((recentHangs) => {
-        if (numHangs === null || recentHangs === null) {
-          panel.port.emit("set-hangs", []);
-          button.label = "Could not retrieve hang stacks.";
-        } else {
+      mostRecentHangs(gIncludeChildHangs, gIncludeParentHangs).then((recentHangs) => {
+        if (hangCount !== null && recentHangs !== null) {
           panel.port.emit("warning", null); // hide the warning banner if it's shown, since we've successfully updated
-          panel.port.emit("set-hangs", recentHangs);
-          if (recentHangs.length > 0) {
-            button.label = "Most recent hang stack:\n\n" + recentHangs[recentHangs.length - 1].stack;
-          } else {
-            button.label = "No recent hang stacks.";
-          }
+        }
+        panel.port.emit("set-hangs", recentHangs || []);
+        if (recentHangs.length > 0) {
+          button.label = "Most recent hang stack:\n\n" + recentHangs[recentHangs.length - 1].stack;
+        } else {
+          button.label = "No recent hang stacks.";
         }
         setTimeout(update, CHECK_FOR_HANG_INTERVAL);
       });
     } else {
-      if (numHangs !== null) {
-        panel.port.emit("warning", null); // hide the warning banner if it's shown, since we've successfully updated
-      }
       setTimeout(update, CHECK_FOR_HANG_INTERVAL);
     }
   });
