@@ -1,10 +1,14 @@
 // emit events on the panel's port for corresponding actions
 var countThreadHangsParentOnly = document.getElementById("countThreadHangsParentOnly");
+var countThreadHangsChildOnly = document.getElementById("countThreadHangsChildOnly");
 var countThreadHangs = document.getElementById("countThreadHangs");
 var countEventLoopLags = document.getElementById("countEventLoopLags");
 var countInputEventResponseLags = document.getElementById("countInputEventResponseLags");
 countThreadHangsParentOnly.addEventListener("click", function() {
   self.port.emit("mode-changed", "threadHangsParentOnly");
+});
+countThreadHangsChildOnly.addEventListener("click", function() {
+  self.port.emit("mode-changed", "threadHangsChildOnly");
 });
 countThreadHangs.addEventListener("click", function() {
   self.port.emit("mode-changed", "threadHangs");
@@ -30,8 +34,12 @@ document.getElementById("clearCount").addEventListener("click", function() {
   self.port.emit("clear-count");
 });
 var includeChildHangs = document.getElementById("includeChildHangs");
+var includeParentHangs = document.getElementById("includeParentHangs");
 includeChildHangs.addEventListener("change", function(event) {
   self.port.emit("include-child-hangs-changed", event.target.checked);
+});
+includeParentHangs.addEventListener("change", function(event) {
+  self.port.emit("include-parent-hangs-changed", event.target.checked);
 });
 
 // listen to re-emitted show event from main script
@@ -40,9 +48,13 @@ self.port.on("show", function(currentSettings) {
   playSound.checked = currentSettings.playSound;
   hangThreshold.value = currentSettings.hangThreshold;
   includeChildHangs.checked = currentSettings.includeChildHangs;
+  includeParentHangs.checked = currentSettings.includeParentHangs;
   switch (currentSettings.mode) {
     case "threadHangsParentOnly":
       document.getElementById("countThreadHangsParentOnly").checked = true;
+      break;
+    case "threadHangsChildOnly":
+      document.getElementById("countThreadHangsChildOnly").checked = true;
       break;
     case "threadHangs":
       document.getElementById("countThreadHangs").checked = true;

@@ -10,7 +10,7 @@ let gOS = Cc["@mozilla.org/observer-service;1"].getService(Ci.nsIObserverService
 
 // load and validate settings
 var gMode = ss.storage.mode;
-if (["threadHangsParentOnly", "threadHangs", "eventLoopLags", "inputEventResponseLags"].indexOf(gMode) < 0) {
+if (["threadHangsParentOnly", "threadHangsChildOnly", "threadHangs", "eventLoopLags", "inputEventResponseLags"].indexOf(gMode) < 0) {
   gMode = "threadHangsParentOnly";
 }
 var gPlaySound = ss.storage.playSound;
@@ -24,6 +24,10 @@ if (typeof gHangThreshold !== "number" || gHangThreshold < 1) {
 var gIncludeChildHangs = ss.storage.includeChildHangs;
 if (typeof gIncludeChildHangs !== "boolean") {
   gIncludeChildHangs = false;
+}
+var gIncludeParentHangs = ss.storage.includeParentHangs;
+if (typeof gIncludeParentHangs !== "boolean") {
+  gIncludeParentHangs = true;
 }
 
 const { setTimeout } = require("sdk/timers");
@@ -86,6 +90,7 @@ function showPanel() {
     playSound: gPlaySound,
     hangThreshold: gHangThreshold,
     includeChildHangs: gIncludeChildHangs,
+    includeParentHangs: gIncludeParentHangs,
   });
 }
 
@@ -113,10 +118,14 @@ panel.port.on("clear-count", function() {
   clearCount();
 });
 
-// toggle whether child hangs are included
+// toggle whether different types of hangs are included
 panel.port.on("include-child-hangs-changed", function(includeChildHangs) {
   gIncludeChildHangs = includeChildHangs;
   ss.storage.includeChildHangs = includeChildHangs;
+});
+panel.port.on("include-parent-hangs-changed", function(includeParentHangs) {
+  gIncludeParentHangs = includeParentHangs;
+  ss.storage.includeParentHangs = includeParentHangs;
 });
 
 // copy a value to the clipboard
@@ -172,9 +181,11 @@ function getChildThreadHangs() {
 function getHangs() {
   switch(gMode) {
     case "threadHangsParentOnly":
-      return numGeckoThreadHangs(false);
+      return numGeckoThreadHangs(false, true);
+    case "threadHangsChildOnly":
+      return numGeckoThreadHangs(true, false);
     case "threadHangs":
-      return numGeckoThreadHangs(true);
+      return numGeckoThreadHangs(true, true);
     case "eventLoopLags":
       return numEventLoopLags();
     case "inputEventResponseLags":
@@ -185,33 +196,36 @@ function getHangs() {
   }
 }
 
-function numGeckoThreadHangs(includeChildHangs = true) {
+function numGeckoThreadHangs(includeChildHangs, includeParentHangs) {
   if (includeChildHangs && !TelemetrySession.getChildThreadHangs) {
     panel.port.emit("warning", "unavailableChildBHR");
     return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
   }
 
-  let geckoThread = Services.telemetry.threadHangStats.find(thread => thread.name == "Gecko");
-  if (!geckoThread || !geckoThread.activity.counts) {
-    panel.port.emit("warning", "unavailableBHR");
-    return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
+  let counts = [];
+  if (includeParentHangs) {
+    geckoThread = Services.telemetry.threadHangStats.find(thread => thread.name == "Gecko");
+    if (!geckoThread || !geckoThread.activity.counts) {
+      panel.port.emit("warning", "unavailableBHR");
+      return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
+    }
+    counts = geckoThread.activity.counts.slice(0);
   }
 
   return new Promise((resolve) => {
     if (includeChildHangs) {
       getChildThreadHangs().then((hangs) => {
         // accumulate all of the counts in the child processes with the counts in the parent process
-        let counts = geckoThread.activity.counts.slice(0);
         hangs.forEach((threadHangStats) => {
           let childGeckoThread = threadHangStats.find(thread => thread.name == "Gecko_Child");
           if (childGeckoThread && childGeckoThread.activity.counts) {
-            childGeckoThread.activity.counts.forEach((count, i) => { counts[i] += count; });
+            childGeckoThread.activity.counts.forEach((count, i) => { counts[i] = (counts[i] || 0) + count; });
           }
         });
         resolve(counts);
       });
     } else { // Just use the parent process stats
-      resolve(geckoThread.activity.counts);
+      resolve(counts);
     }
   }).then((counts) => {
     // see the NOTE in mostRecentHangs() for caveats when using the activity.counts histogram
@@ -270,16 +284,20 @@ function numInputEventResponseLags() {
 let previousCountsMap = {}; // this is a mapping from stack traces (as strings) to corresponding histogram counts
 let cachedRecentHangs = [];
 let lastMostRecentHangsTime = getUptime();
-function mostRecentHangs(includeChildHangs = true) {
+function mostRecentHangs(includeChildHangs, includeParentHangs) {
   if (includeChildHangs && TelemetrySession.getChildThreadHangs === undefined) {
     panel.port.emit("warning", "unavailableChildBHR");
     return Promise.resolve(null);
   }
 
-  let geckoThread = Services.telemetry.threadHangStats.find(thread => thread.name == "Gecko");
-  if (!geckoThread || !geckoThread.activity.counts) {
-    panel.port.emit("warning", "unavailableBHR");
-    return Promise.resolve(null);
+  let parentHangs = [];
+  if (includeParentHangs) {
+    let geckoThread = Services.telemetry.threadHangStats.find(thread => thread.name == "Gecko");
+    if (!geckoThread || !geckoThread.hangs) {
+      panel.port.emit("warning", "unavailableBHR");
+      return Promise.resolve(null);
+    }
+    parentHangs = geckoThread.hangs;
   }
 
   return new Promise((resolve) => {
@@ -293,13 +311,13 @@ function mostRecentHangs(includeChildHangs = true) {
             childHangEntries = childHangEntries.concat(childGeckoThread.hangs);
           }
         });
-        resolve([geckoThread.hangs, childHangEntries]);
+        resolve([parentHangs, childHangEntries]);
       });
     } else { // Just use the parent process stats
-      resolve([geckoThread.hangs, []]);
+      resolve([parentHangs, []]);
     }
   }).then(hangInfo => {
-    [hangEntries, childHangEntries] = hangInfo;
+    [parentHangEntries, childHangEntries] = hangInfo;
     let timestamp = (new Date()).getTime(); // note that this timestamp will only be as accurate as the interval at which this function is called
     let uptime = getUptime(); // this value matches the X axis in the timeline for the Gecko Profiler addon
 
@@ -346,8 +364,12 @@ function mostRecentHangs(includeChildHangs = true) {
       // since we aren't using this entry in the previous hangs anymore, we can just set it in the previous hangs
       previousCountsMap[stack] = counts;
     }
-    hangEntries.forEach(entry => { diffHangEntry(entry, false); });
+
+    // diff the hang entries with their previous counts
+    // this mutates cachedRecentHangs so that it contains the differences
+    parentHangEntries.forEach(entry => { diffHangEntry(entry, false); });
     childHangEntries.forEach(entry => { diffHangEntry(entry, true); });
+
     lastMostRecentHangsTime = uptime;
     return cachedRecentHangs;
   });
@@ -441,7 +463,7 @@ getHangs().then(({numHangs: hangCount, minBucketLowerBound: lower}) => {
   [numHangs, computedThreshold] = [hangCount, lower];
 
   // Call the function once to initialize previousCountsMap properly
-  mostRecentHangs(gIncludeChildHangs).then(() => {
+  mostRecentHangs(gIncludeChildHangs, gIncludeParentHangs).then(() => {
     clearCount();
     setTimeout(update, CHECK_FOR_HANG_INTERVAL); // we set the timeouts each time to not back up the queue of child thread hang stats requests when the browser is really slow
   });
