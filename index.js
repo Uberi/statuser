@@ -61,6 +61,7 @@ var mBaseSVG = RED_SVG;
 var mAnimateSVG = '';
 
 let numHangs = null;
+let shouldClearHangs = true;
 
 var button = ActionButton({
   id: "active-button",
@@ -100,10 +101,7 @@ function showPanel() {
 panel.port.on("mode-changed", function(mode) {
   gMode = mode;
   ss.storage.mode = mode;
-  getHangs().then(({numHangs: hangCount, minBucketLowerBound: lower}) => {
-    numHangs = hangCount;
-    clearCount();
-  });
+  shouldClearHangs = true; // specify that the count should be cleared on the next update
 });
 
 // toggle notification sound on and off
@@ -171,8 +169,10 @@ gBrowser.addTabsProgressListener(webProgressListener);
 // which can be relatively slow if any of the queues are backed up
 let cachedPreviousChildHangs = null;
 let lastChildHangsRetrievedTime = -Infinity;
+const cacheThreadHangsDuration = 300;
 function getChildThreadHangs() {
-  if (Date.now() - lastChildHangsRetrievedTime < 300) {
+  if (Date.now() - lastChildHangsRetrievedTime < cacheThreadHangsDuration) {
+    // the thread hangs have been retrieved very recently, so we can just return those results again
     return Promise.resolve(cachedPreviousChildHangs);
   }
   lastChildHangsRetrievedTime = Date.now();
@@ -182,7 +182,7 @@ function getChildThreadHangs() {
   });
 }
 
-// returns the number of Gecko hangs, and the computed minimum threshold for those hangs (which is a value >= gHangThreshold)
+// returns a promise resolving to the number of Gecko hangs, and the computed minimum threshold for those hangs (which is a value >= gHangThreshold)
 function getHangs() {
   switch(gMode) {
     case "threadHangsParentOnly":
@@ -197,24 +197,26 @@ function getHangs() {
       return numInputEventResponseLags();
     default:
       console.warn("Unknown mode: ", gMode);
-      return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
+      return Promise.reject();
   }
 }
 
 function numGeckoThreadHangs(includeChildHangs, includeParentHangs) {
   if (includeChildHangs && !TelemetrySession.getChildThreadHangs) {
     panel.port.emit("warning", "unavailableChildBHR");
-    return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
+    return Promise.reject();
   }
 
   let counts = [];
+  let ranges = [];
   if (includeParentHangs) {
     geckoThread = Services.telemetry.threadHangStats.find(thread => thread.name == "Gecko");
     if (!geckoThread || !geckoThread.activity.counts) {
       panel.port.emit("warning", "unavailableBHR");
-      return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
+      return Promise.reject();
     }
     counts = geckoThread.activity.counts.slice(0);
+    ranges = geckoThread.activity.ranges;
   }
 
   return new Promise((resolve) => {
@@ -225,20 +227,23 @@ function numGeckoThreadHangs(includeChildHangs, includeParentHangs) {
           let childGeckoThread = threadHangStats.find(thread => thread.name == "Gecko_Child");
           if (childGeckoThread && childGeckoThread.activity.counts) {
             childGeckoThread.activity.counts.forEach((count, i) => { counts[i] = (counts[i] || 0) + count; });
+            if (ranges.length === 0) {
+              ranges = childGeckoThread.activity.ranges;
+            }
           }
         });
-        resolve(counts);
+        resolve();
       });
     } else { // Just use the parent process stats
-      resolve(counts);
+      resolve();
     }
-  }).then((counts) => {
+  }).then(() => {
     // see the NOTE in mostRecentHangs() for caveats when using the activity.counts histogram
     // to summarize, the ranges are the inclusive upper bound of the histogram rather than the inclusive lower bound
     let numHangs = 0;
     let minBucketLowerBound = Infinity;
     counts.forEach((count, i) => {
-      var lowerBound = geckoThread.activity.ranges[i - 1] + 1;
+      var lowerBound = ranges[i - 1] + 1;
       if (lowerBound >= gHangThreshold) {
         numHangs += count;
         minBucketLowerBound = Math.min(minBucketLowerBound, lowerBound);
@@ -253,7 +258,7 @@ function numEventLoopLags() {
     var snapshot = Services.telemetry.getHistogramById("EVENTLOOP_UI_ACTIVITY_EXP_MS").snapshot();
   } catch (e) { // histogram doesn't exist, the Firefox version is likely older than 45.0a1
     panel.port.emit("warning", "unavailableEventLoopLags");
-    return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
+    return Promise.reject();
   }
   let numHangs = 0;
   let minBucketLowerBound = Infinity;
@@ -263,7 +268,6 @@ function numEventLoopLags() {
       minBucketLowerBound = Math.min(minBucketLowerBound, snapshot.ranges[i]);
     }
   }
-  panel.port.emit("warning", null);
   return Promise.resolve({numHangs: numHangs, minBucketLowerBound: minBucketLowerBound});
 }
 
@@ -272,7 +276,7 @@ function numInputEventResponseLags() {
     var snapshot = Services.telemetry.getHistogramById("INPUT_EVENT_RESPONSE_MS").snapshot();
   } catch (e) { // histogram doesn't exist, the Firefox version is likely older than 46.0a1
     panel.port.emit("warning", "unavailableInputEventResponseLags");
-    return Promise.resolve({numHangs: null, minBucketLowerBound: 0});
+    return Promise.reject();
   }
   let numHangs = 0;
   let minBucketLowerBound = Infinity;
@@ -285,14 +289,14 @@ function numInputEventResponseLags() {
   return Promise.resolve({numHangs: numHangs, minBucketLowerBound: minBucketLowerBound});
 }
 
-// Returns an array of the most recent BHR hangs, or null on error
+// returns a promise resolving to an array of the most recent BHR hangs
 let previousCountsMap = {}; // this is a mapping from stack traces (as strings) to corresponding histogram counts
 let cachedRecentHangs = [];
 let lastMostRecentHangsTime = getUptime();
 function mostRecentHangs(includeChildHangs, includeParentHangs) {
   if (includeChildHangs && TelemetrySession.getChildThreadHangs === undefined) {
     panel.port.emit("warning", "unavailableChildBHR");
-    return Promise.resolve(null);
+    return Promise.reject();
   }
 
   let parentHangs = [];
@@ -300,7 +304,7 @@ function mostRecentHangs(includeChildHangs, includeParentHangs) {
     let geckoThread = Services.telemetry.threadHangStats.find(thread => thread.name == "Gecko");
     if (!geckoThread || !geckoThread.hangs) {
       panel.port.emit("warning", "unavailableBHR");
-      return Promise.resolve(null);
+      return Promise.reject();
     }
     parentHangs = geckoThread.hangs;
   }
@@ -438,34 +442,58 @@ function update() {
       panel.port.emit("set-computed-threshold", computedThreshold);
     }
     if (hangCount !== numHangs) { // new hangs detected
-      numHangs = hangCount;
-      updateBadge();
       mostRecentHangs(gIncludeChildHangs, gIncludeParentHangs).then((recentHangs) => {
-        if (hangCount !== null && recentHangs !== null) {
-          panel.port.emit("warning", null); // hide the warning banner if it's shown, since we've successfully updated
+        numHangs = hangCount;
+        if (shouldClearHangs) {
+          clearCount();
+          recentHangs = []; // clear the current list of hangs, which we received before clearing the counts
+          shouldClearHangs = false;
         }
-        panel.port.emit("set-hangs", recentHangs || []);
+        updateBadge();
+
+        // update the button label
         if (recentHangs.length > 0) {
+          // show the hang stack in the button tooltip
           button.label = "Most recent hang stack:\n\n" + recentHangs[recentHangs.length - 1].stack;
         } else {
           button.label = "No recent hang stacks.";
         }
+
+        panel.port.emit("warning", null);
+        panel.port.emit("set-hangs", recentHangs);
+        setTimeout(update, CHECK_FOR_HANG_INTERVAL);
+      }, () => { // failed to retrieve hangs
+        numHangs = hangCount;
+        if (shouldClearHangs) {
+          clearCount();
+          shouldClearHangs = false;
+        }
+        updateBadge();
+
+        // update the button label
+        button.label = "Could not retrieve hang stacks.";
+
+        panel.port.emit("set-hangs", []);
         setTimeout(update, CHECK_FOR_HANG_INTERVAL);
       });
-    } else {
+    } else { // no new hangs
+      if (shouldClearHangs) {
+        clearCount();
+        updateBadge();
+        shouldClearHangs = false;
+      }
       setTimeout(update, CHECK_FOR_HANG_INTERVAL);
+    }
+  }, () => {
+    if (numHangs !== null) {
+      computedThreshold = 0;
+      panel.port.emit("set-computed-threshold", 0);
+      numHangs = null;
+      updateBadge();
     }
   });
 }
-getHangs().then(({numHangs: hangCount, minBucketLowerBound: lower}) => {
-  [numHangs, computedThreshold] = [hangCount, lower];
-
-  // Call the function once to initialize previousCountsMap properly
-  mostRecentHangs(gIncludeChildHangs, gIncludeParentHangs).then(() => {
-    clearCount();
-    setTimeout(update, CHECK_FOR_HANG_INTERVAL); // we set the timeouts each time to not back up the queue of child thread hang stats requests when the browser is really slow
-  });
-});
+update();
 
 /* Enable this rAF loop to verify that the hangs reported are roughly equal
  * to the number of hangs observed from script. In Nightly 45, they were.
