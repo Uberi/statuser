@@ -116,11 +116,6 @@
   <p class="note">On E10S builds, Statuser will <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=1228437" target="_blank">only measure main thread hangs</a>.</p>
   <hr>
   <h1>MOST RECENT HANGS</h1>
-  <div>
-    <label><input type="checkbox" id="includeChildHangs" /> Include child process hangs</label>
-    <label><input type="checkbox" id="includeParentHangs" /> Include parent process hangs</label>
-    <p class="description">Statuser will show either hang stacks from the parent process only, child processes only, or the parent process plus child processes.</p>
-  </div>
   <div id="hangStacks">
     <!-- hang stack entries are added here by `data/panel.js`, and have the following structure: -->
     <!--<div>

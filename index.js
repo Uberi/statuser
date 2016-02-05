@@ -21,14 +21,6 @@ var gHangThreshold = ss.storage.hangThreshold; // ms over which a bucket must st
 if (typeof gHangThreshold !== "number" || gHangThreshold < 1) {
   gHangThreshold = 126;
 }
-var gIncludeChildHangs = ss.storage.includeChildHangs;
-if (typeof gIncludeChildHangs !== "boolean") {
-  gIncludeChildHangs = false;
-}
-var gIncludeParentHangs = ss.storage.includeParentHangs;
-if (typeof gIncludeParentHangs !== "boolean") {
-  gIncludeParentHangs = true;
-}
 
 const { setTimeout } = require("sdk/timers");
 const { ActionButton } = require("sdk/ui/button/action");
@@ -92,8 +84,6 @@ function showPanel() {
     mode: gMode,
     playSound: gPlaySound,
     hangThreshold: gHangThreshold,
-    includeChildHangs: gIncludeChildHangs,
-    includeParentHangs: gIncludeParentHangs,
   });
 }
 
@@ -119,16 +109,6 @@ panel.port.on("hang-threshold-changed", function(hangThreshold) {
 // clear the hang counter
 panel.port.on("clear-count", function() {
   clearCount();
-});
-
-// toggle whether different types of hangs are included
-panel.port.on("include-child-hangs-changed", function(includeChildHangs) {
-  gIncludeChildHangs = includeChildHangs;
-  ss.storage.includeChildHangs = includeChildHangs;
-});
-panel.port.on("include-parent-hangs-changed", function(includeParentHangs) {
-  gIncludeParentHangs = includeParentHangs;
-  ss.storage.includeParentHangs = includeParentHangs;
 });
 
 // copy a value to the clipboard
@@ -293,7 +273,21 @@ function numInputEventResponseLags() {
 let previousCountsMap = {}; // this is a mapping from stack traces (as strings) to corresponding histogram counts
 let cachedRecentHangs = [];
 let lastMostRecentHangsTime = getUptime();
-function mostRecentHangs(includeChildHangs, includeParentHangs) {
+function mostRecentHangs() {
+  let includeParentHangs = false;
+  let includeChildHangs = false;
+  switch(gMode) {
+    case "threadHangsParentOnly":
+      includeParentHangs = true;
+      break;
+    case "threadHangsChildOnly":
+      includeChildHangs = true;
+      break;
+    case "threadHangs":
+      includeParentHangs = includeChildHangs = true;
+      break;
+  }
+
   if (includeChildHangs && TelemetrySession.getChildThreadHangs === undefined) {
     panel.port.emit("warning", "unavailableChildBHR");
     return Promise.reject();
@@ -441,8 +435,8 @@ function update() {
       computedThreshold = lower;
       panel.port.emit("set-computed-threshold", computedThreshold);
     }
-    if (hangCount !== numHangs) { // new hangs detected
-      mostRecentHangs(gIncludeChildHangs, gIncludeParentHangs).then((recentHangs) => {
+    if (hangCount > numHangs) { // new hangs detected
+      mostRecentHangs().then((recentHangs) => {
         numHangs = hangCount;
         if (shouldClearHangs) {
           clearCount();

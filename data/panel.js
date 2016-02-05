@@ -33,22 +33,12 @@ hangThreshold.addEventListener("change", function(event) {
 document.getElementById("clearCount").addEventListener("click", function() {
   self.port.emit("clear-count");
 });
-var includeChildHangs = document.getElementById("includeChildHangs");
-var includeParentHangs = document.getElementById("includeParentHangs");
-includeChildHangs.addEventListener("change", function(event) {
-  self.port.emit("include-child-hangs-changed", event.target.checked);
-});
-includeParentHangs.addEventListener("change", function(event) {
-  self.port.emit("include-parent-hangs-changed", event.target.checked);
-});
 
 // listen to re-emitted show event from main script
 self.port.on("show", function(currentSettings) {
   // populate the settings dialog with the current value of the settings
   playSound.checked = currentSettings.playSound;
   hangThreshold.value = currentSettings.hangThreshold;
-  includeChildHangs.checked = currentSettings.includeChildHangs;
-  includeParentHangs.checked = currentSettings.includeParentHangs;
   switch (currentSettings.mode) {
     case "threadHangsParentOnly":
       document.getElementById("countThreadHangsParentOnly").checked = true;
